@@ -2,172 +2,115 @@ package main
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
-	"fmt"
 	"log"
 	"net/http"
-	"sync"
+	"os/signal"
+	"syscall"
 	"time"
 
-	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-co-op/gocron/v2"
 	"github.com/jackc/pgx/v5"
+	httpadapter "github.com/romanovevgeniy/weather-service/internal/adapter/http"
+	pgadapter "github.com/romanovevgeniy/weather-service/internal/adapter/postgres"
 	"github.com/romanovevgeniy/weather-service/internal/client/http/geocoding"
 	"github.com/romanovevgeniy/weather-service/internal/client/http/open_meteo"
+	"github.com/romanovevgeniy/weather-service/internal/config"
+	httpdelivery "github.com/romanovevgeniy/weather-service/internal/delivery/http"
+	"github.com/romanovevgeniy/weather-service/internal/usecase"
 )
-
-const (
-	HttpPort = ":3000"
-	city     = "moscow"
-)
-
-type Reading struct {
-	Name        string    `db:"name"`
-	Timestamp   time.Time `db:"timestamp"`
-	Temperature float64   `db:"temperature"`
-}
-
-type Storage struct {
-	data map[string][]Reading
-	mu   sync.RWMutex
-}
 
 func main() {
-	r := chi.NewRouter()
-	r.Use(middleware.Logger)
-	ctx := context.Background()
-
-	conn, err := pgx.Connect(ctx, "postgresql://admin:password@localhost:54321/weather")
+	cfg, err := config.Load()
 	if err != nil {
-		panic(err)
+		log.Fatalf("config error: %v", err)
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	conn, err := pgx.Connect(ctx, cfg.PGConnString())
+	if err != nil {
+		log.Fatalf("db connect error: %v", err)
 	}
 	defer conn.Close(ctx)
 
-	r.Get("/{city}", func(w http.ResponseWriter, r *http.Request) {
-
-		cityName := chi.URLParam(r, "city")
-		fmt.Printf("Requested city: %s\n", cityName)
-
-		var reading Reading
-
-		err = conn.QueryRow(
-			ctx,
-			"SELECT name, timestamp, temperature FROM reading WHERE name = $1 ORDER BY timestamp DESC LIMIT 1", city,
-		).Scan(&reading.Name, &reading.Timestamp, &reading.Temperature)
-		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				w.WriteHeader(http.StatusNotFound)
-				w.Write([]byte("Not found"))
-				return
-			}
-		}
-
-		var raw []byte
-		raw, err := json.Marshal(reading)
-		if err != nil {
-			log.Println(err)
-			w.WriteHeader(http.StatusInternalServerError)
-			w.Write([]byte("internal error"))
-			return
-		}
-
-		_, err = w.Write(raw)
-		if err != nil {
-			log.Println(err)
-			w.WriteHeader(http.StatusInternalServerError)
-			w.Write([]byte("internal error"))
-			return
-		}
-	})
-
-	s, err := gocron.NewScheduler()
-	if err != nil {
-		panic(err)
+	if err := ensureSchema(ctx, conn); err != nil {
+		log.Fatalf("ensure schema error: %v", err)
 	}
 
-	jobs, err := initJobs(ctx, s, conn)
-	if err != nil {
-		panic(err)
-	}
-
-	wg := &sync.WaitGroup{}
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		fmt.Println("Server starting on port" + HttpPort)
-		err := http.ListenAndServe(HttpPort, r)
-		if err != nil {
-			panic(err)
-		}
-	}()
-
-	go func() {
-		defer wg.Done()
-		fmt.Printf("Starting job: %v\n", jobs[0].ID())
-		s.Start()
-	}()
-
-	wg.Wait()
-}
-
-func initJobs(ctx context.Context, sheduler gocron.Scheduler, conn *pgx.Conn) ([]gocron.Job, error) {
+	repo := pgadapter.NewReadingRepository(conn, usecase.SystemClock{})
 
 	httpClient := &http.Client{Timeout: 10 * time.Second}
-	geoCodingClient := geocoding.NewClient(*httpClient)
-	openMeteoClient := open_meteo.NewClient(*httpClient)
+	geoClient := geocoding.NewClient(*httpClient)
+	weatherClient := open_meteo.NewClient(*httpClient)
 
-	j, err := sheduler.NewJob(
-		gocron.DurationJob(
-			10*time.Second,
-		),
-		gocron.NewTask(
-			func() {
-				geoRes, err := geoCodingClient.GetCoords(city)
-				if err != nil {
-					log.Println(err)
-					return
-				}
+	geoSvc := httpadapter.NewGeocodingAdapter(geoClient)
+	weatherSvc := httpadapter.NewWeatherAdapter(weatherClient)
 
-				openMetRes, err := openMeteoClient.GetTemperature(geoRes.Latitude, geoRes.Longitude)
-				if err != nil {
-					log.Println(err)
-					return
-				}
+	getLatest := usecase.NewGetLatestReading(repo)
+	ingester := usecase.NewIngestWeather(repo, geoSvc, weatherSvc, usecase.SystemClock{}, cfg.DefaultCity)
 
-				timestamp, err := time.Parse("2006-01-02T15:04", openMetRes.Current.Time)
+	srv := httpdelivery.NewServer(getLatest)
 
-				_, err = conn.Exec(
-					ctx,
-					"INSERT INTO reading (name, temperature, timestamp) VALUES ($1, $2, $3)",
-					city, openMetRes.Current.Temperature2m, timestamp,
-				)
-				if err != nil {
-					log.Println(err)
-					return
-				}
+	scheduler, err := gocron.NewScheduler()
+	if err != nil {
+		log.Fatalf("scheduler error: %v", err)
+	}
 
-				fmt.Printf("%v Update data for city: %s\n", time.Now(), city)
-			},
-		),
+	if _, err := initJobs(ctx, scheduler, ingester, cfg.JobInterval); err != nil {
+		log.Fatalf("init jobs error: %v", err)
+	}
+
+	httpSrv := &http.Server{
+		Addr:              ":" + cfg.HTTPPort,
+		Handler:           srv.Router(),
+		ReadTimeout:       5 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	go func() {
+		log.Printf("Server listening on :%s", cfg.HTTPPort)
+		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("http serve error: %v", err)
+		}
+	}()
+
+	go scheduler.Start()
+
+	<-ctx.Done()
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelShutdown()
+	_ = httpSrv.Shutdown(shutdownCtx)
+}
+
+func initJobs(ctx context.Context, scheduler gocron.Scheduler, ingester *usecase.IngestWeather, interval time.Duration) ([]gocron.Job, error) {
+	j, err := scheduler.NewJob(
+		gocron.DurationJob(interval),
+		gocron.NewTask(func() {
+			if err := ingester.Execute(ctx); err != nil {
+				log.Println("ingest error:", err)
+			} else {
+				log.Printf("%v updated data for city", time.Now())
+			}
+		}),
 	)
 	if err != nil {
 		return nil, err
 	}
-
 	return []gocron.Job{j}, nil
 }
 
-func runCron() {
-
-	select {
-	case <-time.After(time.Minute):
-	}
-
-	//err = s.Shutdown()
-	//if err != nil {
-	//
-	//}
+func ensureSchema(ctx context.Context, conn *pgx.Conn) error {
+	_, err := conn.Exec(ctx, `
+CREATE TABLE IF NOT EXISTS reading (
+  name text NOT NULL,
+  timestamp timestamptz NOT NULL,
+  temperature double precision NOT NULL
+);
+CREATE INDEX IF NOT EXISTS reading_name_timestamp_idx
+  ON reading (name, timestamp DESC);
+`)
+	return err
 }
