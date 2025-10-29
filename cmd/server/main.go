@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -11,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-co-op/gocron/v2"
+	"github.com/jackc/pgx/v5"
 	"github.com/romanovevgeniy/weather-service/internal/client/http/geocoding"
 	"github.com/romanovevgeniy/weather-service/internal/client/http/open_meteo"
 )
@@ -21,8 +23,9 @@ const (
 )
 
 type Reading struct {
-	Timestamp   time.Time
-	Temperature float64
+	Name        string    `db:"name"`
+	Timestamp   time.Time `db:"timestamp"`
+	Temperature float64   `db:"temperature"`
 }
 
 type Storage struct {
@@ -33,26 +36,31 @@ type Storage struct {
 func main() {
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
+	ctx := context.Background()
 
-	storage := &Storage{
-		data: make(map[string][]Reading),
+	conn, err := pgx.Connect(ctx, "postgresql://admin:password@localhost:54321/weather")
+	if err != nil {
+		panic(err)
 	}
+	defer conn.Close(ctx)
 
 	r.Get("/{city}", func(w http.ResponseWriter, r *http.Request) {
 
 		cityName := chi.URLParam(r, "city")
 		fmt.Printf("Requested city: %s\n", cityName)
 
-		storage.mu.RLock()
-		defer storage.mu.RUnlock()
+		var reading Reading
 
-		reading, ok := storage.data[cityName]
-		if !ok {
-			w.WriteHeader(http.StatusNotFound)
-			w.Write([]byte("Not found"))
-			return
+		err = conn.QueryRow(
+			ctx,
+			"SELECT name, timestamp, temperature FROM reading WHERE name = $1 ORDER BY timestamp DESC LIMIT 1", city,
+		).Scan(&reading.Name, &reading.Timestamp, &reading.Temperature)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte("internal error"))
 		}
 
+		var raw []byte
 		raw, err := json.Marshal(reading)
 		if err != nil {
 			log.Println(err)
@@ -69,7 +77,7 @@ func main() {
 		panic(err)
 	}
 
-	jobs, err := initJobs(s, storage)
+	jobs, err := initJobs(ctx, s, conn)
 	if err != nil {
 		panic(err)
 	}
@@ -79,7 +87,7 @@ func main() {
 
 	go func() {
 		defer wg.Done()
-		fmt.Println("Server starting on port " + HttpPort)
+		fmt.Println("Server starting on port" + HttpPort)
 		err := http.ListenAndServe(HttpPort, r)
 		if err != nil {
 			panic(err)
@@ -88,14 +96,14 @@ func main() {
 
 	go func() {
 		defer wg.Done()
-		fmt.Printf("Starting job: %v", jobs[0].ID())
+		fmt.Printf("Starting job: %v\n", jobs[0].ID())
 		s.Start()
 	}()
 
 	wg.Wait()
 }
 
-func initJobs(sheduler gocron.Scheduler, storage *Storage) ([]gocron.Job, error) {
+func initJobs(ctx context.Context, sheduler gocron.Scheduler, conn *pgx.Conn) ([]gocron.Job, error) {
 
 	httpClient := &http.Client{Timeout: 10 * time.Second}
 	geoCodingClient := geocoding.NewClient(*httpClient)
@@ -119,16 +127,19 @@ func initJobs(sheduler gocron.Scheduler, storage *Storage) ([]gocron.Job, error)
 					return
 				}
 
-				storage.mu.Lock()
-				defer storage.mu.Unlock()
-
 				timestamp, err := time.Parse("2006-01-02T15:04", openMetRes.Current.Time)
-				storage.data[city] = append(storage.data[city], Reading{
-					Timestamp:   timestamp,
-					Temperature: openMetRes.Current.Temperature2m,
-				})
 
-				fmt.Printf("%v Update data for city: %s", time.Now(), city)
+				_, err = conn.Exec(
+					ctx,
+					"INSERT INTO reading (name, temperature, timestamp) VALUES ($1, $2, $3)",
+					city, openMetRes.Current.Temperature2m, timestamp,
+				)
+				if err != nil {
+					log.Println(err)
+					return
+				}
+
+				fmt.Printf("%v Update data for city: %s\n", time.Now(), city)
 			},
 		),
 	)
