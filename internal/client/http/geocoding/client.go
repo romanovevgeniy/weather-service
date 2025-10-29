@@ -1,9 +1,12 @@
 package geocoding
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 )
 
 type Response struct {
@@ -22,10 +25,27 @@ func NewClient(httpClient http.Client) *client {
 	}
 }
 
-func (c client) GetCoords(city string) (Response, error) {
-	res, err := c.httpClient.Get(
-		fmt.Sprintf("https://geocoding-api.open-meteo.com/v1/search?name=%s&count=1&language=ru&format=json", city),
-	)
+func (c client) GetCoords(ctx context.Context, city string) (Response, error) {
+	if city == "" {
+		return Response{}, errors.New("city is required")
+	}
+
+	endpoint := "https://geocoding-api.open-meteo.com/v1/search"
+	q := url.Values{}
+	q.Set("name", city)
+	q.Set("count", "1")
+	q.Set("language", "ru")
+	q.Set("format", "json")
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"?"+q.Encode(), nil)
+	if err != nil {
+		return Response{}, err
+	}
+
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "weather-service/1.0")
+
+	res, err := c.httpClient.Do(req)
 	if err != nil {
 		return Response{}, err
 	}
@@ -45,5 +65,8 @@ func (c client) GetCoords(city string) (Response, error) {
 		return Response{}, err
 	}
 
+	if len(geoResp.Results) == 0 {
+		return Response{}, errors.New("no results")
+	}
 	return geoResp.Results[0], nil
 }

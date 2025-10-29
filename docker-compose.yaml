@@ -3,11 +3,11 @@ services:
     image: postgres:18.0
     restart: always
     environment:
-      POSTGRES_USER: "admin"
-      POSTGRES_PASSWORD: "password"
-      POSTGRES_DB: "weather"
+      POSTGRES_USER: ${DB_USER:-admin}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in your env}
+      POSTGRES_DB: ${DB_NAME:-weather}
     ports:
-      - "54321:5432"
+      - "5432:5432"
     volumes:
       - test_volume:/var/lib/postgresql
 
