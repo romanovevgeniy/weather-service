@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"net/http"
 	"os/signal"
@@ -32,7 +33,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("db connect error: %v", err)
 	}
-	defer conn.Close(ctx)
+	defer func(conn *pgx.Conn, ctx context.Context) {
+		err := conn.Close(ctx)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}(conn, ctx)
 
 	if err := ensureSchema(ctx, conn); err != nil {
 		log.Fatalf("ensure schema error: %v", err)
@@ -72,7 +78,7 @@ func main() {
 
 	go func() {
 		log.Printf("Server listening on :%s", cfg.HTTPPort)
-		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("http serve error: %v", err)
 		}
 	}()
